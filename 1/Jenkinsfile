@@ -1,0 +1,205 @@
+@Library('shared-library') _
+// This imports a shared library that contains reusable code or functions for Jenkins pipelines.
+// Shared libraries help maintain cleaner, reusable pipelines for multiple projects.
+
+def IMAGE_NAME = 'my-application' 
+// The name of the Docker container image to be built and used in the deployment process.
+
+def IMAGE_TAG = "${env.BUILD_NUMBER}" 
+// A unique identifier for the Docker image, using the build number to ensure every build is traceable.
+
+def AWS_REGION = 'us-west-2' 
+// The AWS region where the ECS clusters and other resources are located.
+
+pipeline {
+    agent any 
+    // Defines where the pipeline should run. 'any' allows Jenkins to choose any available agent.
+
+    environment {
+        DOCKER_REGISTRY = credentials('docker-registry-credentials') 
+        // Securely fetches Docker registry credentials from the Jenkins credential store.
+
+        AWS_CREDENTIALS = credentials('aws-credentials') 
+        // Securely fetches AWS credentials from the Jenkins credential store.
+
+        SONAR_TOKEN = credentials('sonar-token') 
+        // Securely fetches the SonarQube authentication token from the Jenkins credential store.
+    }
+
+    options {
+        timeout(time: 1, unit: 'HOURS') 
+        // Ensures the pipeline stops if it runs for more than one hour, preventing stuck jobs.
+
+        parallelsAlwaysFailFast() 
+        // If one parallel task fails, other parallel tasks stop immediately.
+
+        ansiColor('xterm') 
+        // Formats the console output to use colors for better readability and debugging.
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm 
+                // Checks out the source code from the repository specified in the Jenkins job configuration.
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    sh '''
+                        ./gradlew clean build --no-daemon 
+                        // Cleans previous build artifacts and compiles the source code.
+
+                        ./gradlew test --no-daemon 
+                        // Runs unit tests to ensure the code is functioning correctly.
+                    '''
+                }
+            }
+        }
+
+        stage('Static Analysis') {
+            parallel {
+                stage('SonarQube') {
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            // Configures the SonarQube environment for static code analysis.
+                            sh './gradlew sonarqube' 
+                            // Uploads code analysis results to the SonarQube server.
+                        }
+                    }
+                }
+                stage('Dependency Check') {
+                    steps {
+                        sh './gradlew dependencyCheckAnalyze' 
+                        // Scans for vulnerabilities in the project's dependencies.
+                    }
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                script {
+                    def scannerHome = tool 'OWASP Dependency-Check' 
+                    // Locates the OWASP Dependency-Check tool installed in Jenkins.
+
+                    withEnv(["PATH+SCANNER=${scannerHome}/bin"]) {
+                        sh 'dependency-check.sh --scan ./ --format HTML' 
+                        // Runs a security scan on the project's codebase and generates an HTML report.
+                    }
+                }
+            }
+        }
+
+        stage('Build Container') {
+            steps {
+                script {
+                    docker.build("${IMAGE_NAME}:${IMAGE_TAG}") 
+                    // Builds a Docker image with the defined name and tag.
+
+                    sh "trivy image ${IMAGE_NAME}:${IMAGE_TAG}" 
+                    // Scans the Docker image for vulnerabilities using Trivy.
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                script {
+                    sh './gradlew integrationTest' 
+                    // Runs integration tests to verify how different parts of the application work together.
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop' 
+                // Ensures this stage runs only for the 'develop' branch.
+            }
+            steps {
+                script {
+                    withAWS(credentials: 'AWS_CREDENTIALS', region: AWS_REGION) {
+                        // Configures AWS CLI commands to use the specified credentials and region.
+
+                        sh """
+                            aws ecs update-service \
+                                --cluster staging-cluster \
+                                --service ${IMAGE_NAME} \
+                                --force-new-deployment 
+                                // Forces a new deployment of the service in the ECS staging cluster.
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Tests') {
+            when {
+                branch 'develop' 
+                // Runs smoke tests only for the 'develop' branch after deployment to staging.
+            }
+            steps {
+                script {
+                    sh './gradlew smokeTest' 
+                    // Runs smoke tests to validate basic functionality in the staging environment.
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main' 
+                // Ensures this stage runs only for the 'main' branch, representing production deployments.
+            }
+            steps {
+                timeout(time: 1, unit: 'HOURS') {
+                    input message: 'Deploy to production?' 
+                    // Waits for manual approval before proceeding with the production deployment.
+                }
+                script {
+                    withAWS(credentials: 'AWS_CREDENTIALS', region: AWS_REGION) {
+                        sh """
+                            aws ecs update-service \
+                                --cluster production-cluster \
+                                --service ${IMAGE_NAME} \
+                                --force-new-deployment 
+                                // Deploys the service to the ECS production cluster.
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            junit '**/build/test-results/**/*.xml' 
+            // Publishes JUnit test results for reporting and analysis.
+
+            publishHTML([
+                allowMissing: false,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: 'build/reports/tests',
+                reportFiles: 'index.html',
+                reportName: 'Test Report' 
+                // Generates an HTML report of test results and makes it accessible from Jenkins.
+            ])
+        }
+        success {
+            slackSend channel: '#deployments',
+                      color: 'good',
+                      message: "Success: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'" 
+                      // Sends a success notification to a Slack channel.
+        }
+        failure {
+            slackSend channel: '#deployments',
+                      color: 'danger',
+                      message: "Failed: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'" 
+                      // Sends a failure notification to a Slack channel.
+        }
+    }
+}
